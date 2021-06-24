@@ -1,37 +1,46 @@
 import os
 
 import numpy as np
+import numpy.ma as ma
 from scipy.io.wavfile import write
 from scipy.signal import find_peaks
 
 import matplotlib.pyplot as plt
 
-import parselmouth
+from parselmouth import Sound
 from tones import mixer
 from librosa.core import hz_to_midi, midi_to_hz
 from essentia.standard import MetadataReader, EqloudLoader
 
 
 
-def extract_melody(path=None, audio=None, sf=44100, quantise=False, verbose=False, **kwargs):
+def extract_melody(fp=None, audio=None, sf=44100, quantise=False, retune=True,
+                   pitch_method='praat', return_data=False, verbose=False, **kwargs):
 
     '''Automatically extract the musical note sequence from raw audio imput
     of natural speech.
 
     Parameters
     ----------
-    path : str, optional
+    fp : str, optional
         File path to audio file. If None then must supply `audio` (and associated
         `sf`). Default None.
     audio : array_like, optional
         Numpy array containing the audio sampled at sample frequency `sf`. Required
-        if `path` is not provided. Defualt None.
+        if `fp` is not provided. Defualt None.
     sf : {32000, 44100, 48000}, optional
         The sample frequency (in Hertz) of the audio array `audio`, if provided.
-        Ignored if `path` is used. Default 44100.
+        Ignored if `fp` is used. Default 44100.
     quantise : bool, optional
         Whether to quantise the note values to match those of MIDI notes (where A=440Hz).
         Default False.
+    retune : bool, optional
+        Whether to retune the pitches such that on average pitches are close to MIDI notes.
+        Default False.
+    pitch_method : {'praat', 'crepe'}, optional
+        Algorithm to extract the pitch contour. Defualt 'praat'.
+    return_data : bool, optional
+        Return the pitch and intensity contour as well. Default False.
     verbose : bool, optional
         Print details. Default False.
     **kwargs : optional
@@ -46,47 +55,98 @@ def extract_melody(path=None, audio=None, sf=44100, quantise=False, verbose=Fals
         Note lengths (in seconds).
     nv : array
         Note values (in Hertz).
+    data : dict, optional
+        Containing `pitch`, `intensity` data. Returned only if `return_data` is True.
 
 
     Raises
     ------
     ValueError
-        If neither `path` nor 'audio' is provided.
+        If neither `fp` nor 'audio' is provided.
     ValueError
-        If `path` cannot be found.
-
+        If `fp` cannot be found.
+    ValueError
+        If `sf` not in {32000, 44100, 48000}.
     '''
 
+    if verbose:
+        print('== Starting extracting notes with kwargs', kwargs)
 
-    if type(path) != type(None):
-        if not os.path.isfile(path):
-            raise ValueError('Path {} not found.'.format(path))
+    if fp is not None:
+        if not os.path.isfile(fp):
+            raise ValueError('Path {} not found.'.format(fp))
 
-        sf = MetadataReader(filename=path)()[10]
-        audio = EqloudLoader(filename=path, sampleRate=sf)()
+        sf = MetadataReader(filename=fp)()[10]
+        audio = EqloudLoader(filename=fp, sampleRate=sf)()
 
-    elif type(audio) == type(None):
+    elif audio is None:
         raise ValueError('Must provide either filepath (`path`) or array of audio data (`audio`).')
 
     if sf not in {32000, 44100, 48000}:
-        raise ValueError('Sample frequency `sf` must be in {32000, 44100, 48000}.')
+        raise ValueError('Sample frequency `sf` {} not in {32000, 44100, 48000}.'.format(sf))
 
     # Sound object as parsed by Praat
-    sound = parselmouth.Sound(values=np.asarray(audio, dtype=np.float64), sampling_frequency=sf)
-
-    # Pitch and Intensity vectors
-    p = sound.to_pitch_ac(time_step=0.01, octave_jump_cost=0.6)
-    I = sound.to_intensity(minimum_pitch=50, time_step=0.01)
-
+    sound = Sound(values=np.asarray(audio, dtype=np.float64), sampling_frequency=sf)
     end_time = sound.end_time
-    #ts = np.linspace(0, end_time, len(p))
 
     if verbose:
         print('- Loaded audio: sf={}, length={:.2f} seconds'.format(sf, end_time))
 
-    _, _, nuclei = segment_notes(I, p, verbose=verbose, **kwargs)
 
-    ns, nl, nv = get_notes(I, p, nuclei, verbose=verbose, **kwargs)
+    # Pitch and Intensity vectors
+
+    if pitch_method == 'praat':
+        ts = np.arange(0, end_time, 0.01)
+        pitch = sound.to_pitch_ac(time_step=0.01, octave_jump_cost=0.6)
+        p = []
+
+        for t in ts:
+            p.append(pitch.get_value_at_time(t))
+
+    elif pitch_method == 'crepe':
+        import crepe
+        # check if f0.csv exists for file
+        if fp is not None:
+            f0_path = fp[:-3] + 'f0.csv'
+            if not os.path.exists(f0_path):
+                crepe.process_file(fp)
+
+            data = np.genfromtxt(f0_path, dtype=None, skip_header=1, delimiter=',')
+
+        else:
+            data = crepe.predict(audio, sf, verbose=0)
+            data = np.stack(data[:3]).T
+
+        ts = data[:, 0]
+        p = data[:, 1]
+        p[np.where(data[:, 2] < 0.5)] = np.nan
+
+    else:
+        raise ValueError('`pitch_method` must be in {"praat", "crepe"}')
+
+
+    intensity = sound.to_intensity(minimum_pitch=50, time_step=0.01)
+    I = []
+
+    for t in ts:
+        I.append(intensity.get_value(t))
+
+    p = np.array(p)
+    p[p == 0] = np.nan
+    I = np.array(I)
+    I[np.isnan(I)] = 0
+
+    if verbose:
+    	print('- Computed pitch and intensity contours.')
+
+    if retune:
+        if verbose:
+            print('- Retuning pitches.')
+        p = retunePitches(p)
+
+
+    _, _, nuclei = segment_notes(I, p, ts, verbose=verbose, **kwargs)
+    ns, nl, nv = get_notes(I, p, ts, nuclei, verbose=verbose, **kwargs)
 
     if verbose:
         print('== Found {} notes.'.format(len(nv)))
@@ -97,24 +157,30 @@ def extract_melody(path=None, audio=None, sf=44100, quantise=False, verbose=Fals
         nv = quantise_notes(nv)
 
     if verbose:
-        print('\n== Done')
+        print('\n== Done\n')
 
-    return ns, nl, nv
+    if return_data:
+        data = {'pitch': p, 'intensity': I, 'ts': ts, 'nuclei': nuclei}
+        return ns, nl, nv, data
+    else:
+        return ns, nl, nv
 
 
 
-def segment_notes(intensity, pitch, maxDip=0.5, minDipBefore=2.1, minDipAfter=0.5,
-                  threshold=0, verbose=False):
+def segment_notes(intensity, pitch, ts, maxDip=0.125, minDipBefore=2.0, minDipAfter=0.0,
+                  threshold=0, verbose=False, **kwargs):
 
     '''Identifies the note boundaries from the nuclei of the vocalic sections of the audio.
 
     Parameters
     ----------
-    intensity : parselmouth.Intensity
+    intensity : array-like
         The intensity vector of the audio.
-    pitch : parselmouth.Pitch
+    pitch : array-like
         The pitch vector containing the F0 frequency contour. Required to filter unpitched
         nuclei.
+    ts : array-like
+        The timesteps of pitch and intensity.
     maxDip : float, optional
         Default 0.5.
     minDipBefore : float, optional
@@ -129,7 +195,7 @@ def segment_notes(intensity, pitch, maxDip=0.5, minDipBefore=2.1, minDipAfter=0.
     Returns
     -------
     peaks_init : array
-        Time stamps of all the peaks of I (including at time 0).
+        Time stamps of all the peaks of I (includes time 0).
     peaks : array
         Time stamps of filtered peaks of I.
     nuclei : array
@@ -139,14 +205,11 @@ def segment_notes(intensity, pitch, maxDip=0.5, minDipBefore=2.1, minDipAfter=0.
 
     if verbose:
         print('== Segmenting notes.')
-    I = intensity.values[0]
-    t = intensity.ts()
+        print(f'intensity.shape={intensity.shape}, pitch.shape={pitch.shape}, ts.shape={ts.shape}, \
+        maxDip={maxDip}, minDipBefore={minDipBefore}, minDipAfter={minDipAfter}, threshold={threshold}')
+        print(f'{kwargs}')
 
-    peaks_init = np.array([t[0]] + list(t[find_peaks(I)[0]]))
-
-    f0 = pitch.selected_array['frequency']
-    f0[f0 == 0] = np.nan
-    f0_t = pitch.ts()
+    peaks_init = np.array([0] + list(ts[find_peaks(intensity)[0]]))
 
     if verbose:
         print('Found', len(peaks_init), 'peaks')
@@ -159,27 +222,36 @@ def segment_notes(intensity, pitch, maxDip=0.5, minDipBefore=2.1, minDipAfter=0.
         try:
             p_i1 = peaks_init[i+1]
         except:
-            p_i1 = t[-1]
+            p_i1 = ts[-1]
 
         margin = 0.1
-        pitch_around = f0[np.where(np.logical_and(f0_t>=p_i-margin, f0_t<p_i+margin))]
+        pitch_around = pitch[np.where(np.logical_and(ts>=p_i-margin, ts<p_i+margin))]
 
-        if intensity.get_value(time=p_i) < threshold:
+        #peak_idx = np.argmin(np.abs(ts - p_i))
+        peak_idx = np.searchsorted(ts, p_i)
+
+        if peak_idx > 0 and peak_idx < len(intensity) - 2:
+            I_p = np.mean(intensity[peak_idx-1:peak_idx+1])
+        else:
+            I_p = intensity[0]
+
+        if I_p < threshold:
+        #if intensity.get_value(time=p_i) < threshold:
             # Filter 1: below threshold...
             remove.append(i)
             if verbose: print(' - peak at {:.4f} too low'.format(p_i))
 
         elif any(np.isfinite(pitch_around)):
             # Filter 2: voiced/pitched...
-            i_range = I[np.where(np.logical_and(t>=p_i, t<p_i1))]
+            i_range = intensity[np.where(np.logical_and(ts>=p_i, ts<p_i1))]
 
-            if np.abs(intensity.get_value(time=p_i) - np.min(i_range)) < maxDip:
+            if np.abs(intensity[peak_idx] - np.min(i_range)) < maxDip:
                 # Filter 3: small dip...
                 remove.append(i)
                 if verbose: print(' - peak at {:.4f} too small'.format(p_i))
         else:
             remove.append(i)
-            if verbose: print(' - peak at {:.4f} unvoiced'.format(p_i))
+            if verbose: print(' - peak at {:.4f} unpitched'.format(p_i))
 
     if verbose:
         print('- (Removing', len(remove), 'peaks)')
@@ -192,15 +264,24 @@ def segment_notes(intensity, pitch, maxDip=0.5, minDipBefore=2.1, minDipAfter=0.
         if i == 0:
             I_before = 0
         else:
-            I_before = np.min(I[np.where(np.logical_and(t>=peaks[i-1], t<peaks[i]))])
+            I_before = np.min(intensity[np.where(np.logical_and(ts>=peaks[i-1], ts<peaks[i]))])
 
         if i < len(peaks) - 1:
-            I_after = np.min(I[np.where(np.logical_and(t>=peaks[i], t<peaks[i+1]))])
+            I_after = np.min(intensity[np.where(np.logical_and(ts>=peaks[i], ts<peaks[i+1]))])
         else:
             I_after = 0
 
-        a = np.abs(intensity.get_value(time=peaks[i]) - I_after) >= minDipAfter
-        b = np.abs(intensity.get_value(time=peaks[i]) - I_before) >= minDipBefore
+        #I_peak = intensity[np.argmin(np.abs(ts - peaks[i]))]
+
+        peak_idx = np.searchsorted(ts, peaks[i])
+
+        if peak_idx > 0:
+            I_p = np.mean(intensity[peak_idx-1:peak_idx+1])
+        else:
+            I_p = intensity[0]
+
+        a = np.abs(I_p - I_after) >= minDipAfter
+        b = np.abs(I_p - I_before) >= minDipBefore
 
         if a and b:
             nuclei.append(peaks[i])
@@ -213,18 +294,19 @@ def segment_notes(intensity, pitch, maxDip=0.5, minDipBefore=2.1, minDipAfter=0.
 
 
 
-def get_notes(intensity, pitch, nuclei, minLength=0.05, unstable=4.5, maxUnstable=8.8,
-              method='derivatives', verbose=False):
+def get_notes(intensity, pitch, ts, nuclei, minLength=0.0, unstable=5.0, maxUnstable=13.5,
+              method='derivatives', verbose=False, **kwargs):
 
     '''Returns the note value of the segmented note regions.
 
     Parameters
     ----------
-    intensity : parselmouth.Intensity
+    intensity : array-like
         The intensity vector of the audio.
-    pitch : parselmouth.Pitch
+    pitch : array-like
         The pitch vector containing the F0 frequency contour.
-        nuclei.
+    ts : array-like
+        The timesteps of pitch and intensity.
     nuclei : array-like
         List of timestamps of identified nuclei.
     minLength : float, optional
@@ -246,26 +328,31 @@ def get_notes(intensity, pitch, nuclei, minLength=0.05, unstable=4.5, maxUnstabl
     '''
 
     if verbose:
-        print('\n== Extracting melody:')
+        print('\n== Extracting melody using', method, 'method')
+    #if method not in ('derivatives', 'mean', 'mean_stable', 'max', 'max_stable'):
+    #    raise ValueError('method {} not in ("derivatives", "mean", "mean_stable", "max", "max_stable")'.format(method))
 
-    if method not in {'derivatives', 'mean', 'mean_stable', 'max', 'max_stable'}:
-        raise ValueError('method {} not in ("derivatives", "mean", "mean_stable", "max", "max_stable")'.format(method))
+    #I = intensity.values[0]
+    #t = intensity.ts()
+    #dt = intensity.dt
 
-    I = intensity.values[0]
-    t = intensity.ts()
-    dt = intensity.dt
+    #I_t = np.linspace(0, end_time, len(intensity))
+    dt = ts[1] - ts[0]
+
+    #t_p = np.linspace(0, end_time, len(pitch))
 
     if verbose:
         print('Cleaning pitch track')
-    f0 = pitch.selected_array['frequency']
-    f0 = clean_f0(f0)
+    pitch = clean_f0(pitch)
+    #f0 = pitch.selected_array['frequency']
+    #f0 = clean_f0(f0)
 
-    t_p = pitch.ts()
+    #t_p = pitch.ts()
     note_start, note_length, note_pitch = [], [], []
 
     # include first boundary from first voiced pitch
     try:
-        note_boundaries = [t_p[np.where(np.isfinite(f0))][0]]
+        note_boundaries = [ts[np.where(np.isfinite(pitch))][0]]
     except IndexError:
         # f0 all np.nan, return empty
         if verbose:
@@ -273,17 +360,18 @@ def get_notes(intensity, pitch, nuclei, minLength=0.05, unstable=4.5, maxUnstabl
         return np.array([]), np.array([]), np.array([])
 
     for n1, n2 in zip(nuclei[:-1], nuclei[1:]):
-        I_between = I[np.where(np.logical_and(t>=n1, t<n2))]
-        note_boundaries.append(n1 + dt*np.argmin(I_between))
+        I_between = intensity[np.where(np.logical_and(ts>=n1, ts<n2))]
+        if len(I_between) > 0:
+            note_boundaries.append(n1 + dt*np.argmin(I_between))
 
     # include last time point (when I finally dips below 50)
     try:
-        note_boundaries.append(t[np.where(I > 50)[0][-1]])
+        note_boundaries.append(ts[np.where(intensity > 50)[0][-1]])
     except IndexError:
-        note_boundaries.append(t_p[-1])
+        note_boundaries.append(ts[-1])
 
     for t1, t2 in zip(note_boundaries[:-1], note_boundaries[1:]):
-        p_note = f0[np.where(np.logical_and(t1 <= t_p, t_p < t2))]
+        p_note = pitch[np.where(np.logical_and(t1 <= ts, ts < t2))]
         if len(p_note) == 0 or sum(np.isfinite(p_note))/len(p_note) < 0.25:
             if verbose: print(' - note at {:.2f}: too unpitched, ignoring'.format(t1))
             continue
@@ -299,10 +387,9 @@ def get_notes(intensity, pitch, nuclei, minLength=0.05, unstable=4.5, maxUnstabl
             if verbose: print(' - note at {:.2f}: too short ({} < {}), ignoring'.format(t1, t2-start, minLength))
             continue
 
-        # weigh by intensity??
         p_note = p_note[np.where(np.isfinite(p_note))]
         dp = np.diff(p_note, n=1)
-        if len(dp) == 0:
+        if len(dp) == 0 or len(p_note) < 3:
             continue
 
         note_start.append(start)
@@ -347,14 +434,64 @@ def get_notes(intensity, pitch, nuclei, minLength=0.05, unstable=4.5, maxUnstabl
         elif method == 'mean_stable':
             # find most stable regions
             p_stable = p_note[np.where(dp < unstable)]
-            if len(p_stable) == 0:
+            if len(p_stable) < 2:
                 # fall back to method mean for very unstable notes
                 note_pitch.append(np.nanmean(p_note))
             else:
                 note_pitch.append(np.nanmean(p_stable))
+        else:
             raise(ValueError('method {} not in ("derivatives", "mean", "mean_stable", "max", "max_stable")'.format(method)))
 
     return np.array(note_start), np.array(note_length), np.array(note_pitch)
+
+
+def retunePitches(pitch, tuning=440):
+    '''Transposes pitches such that on average frequencies are close to 12 tone equal temperment
+    tuning at reference with respect to a reference pitch.
+
+    Parameters
+    ----------
+    pitch : array-like
+        The pitch contour (in Hertz)
+    tuning : float (optional)
+        Frequency of reference pitch A4 tune to. Default 440.
+
+    Returns
+    -------
+    retuned : array
+        Retuned pitches.
+
+    '''
+
+    # mask invalid pitchs (i.e. NaNs and 0)
+    pitch = ma.masked_invalid(pitch)
+    pitch = ma.masked_equal(pitch, 0)
+
+    invalid_idxs = pitch.mask
+
+    # convert to semitones values, such that 1 step corresponds to a semitone
+    n = 12 * np.log2(pitch / tuning)
+
+    # take the modulo 1 of each pitch
+    mod = np.mod(n, 1)
+
+    # convert into an 'angle' around a circle
+    alpha = np.pi * 2 * mod
+
+    # compute circular mean
+    mean_sin = np.mean(np.sin(alpha))
+    mean_cos = np.mean(np.cos(alpha))
+    mean = np.arctan2(mean_sin, mean_cos)
+
+    # average distance pitches are away from notes
+    offset = mean / (np.pi * 2)
+    n += offset
+    retuned = tuning * np.power(2, n / 12)
+
+    retuned = np.array(retuned)
+    retuned[invalid_idxs] = np.nan
+
+    return retuned
 
 
 
@@ -370,7 +507,7 @@ def quantise_notes(notes):
     Returns
     -------
     notes : array
-        List of quantised notes, matching the format of `notes`.
+        List of quantised notes, matching the shape of `notes`.
 
 
     Raises
@@ -427,7 +564,7 @@ def clean_f0(f0):
     return clean
 
 
-def plot_notes(notes, ax=None, **kwargs):
+def plot_notes(notes, ax=None, octave=0, thickness=0.2, **kwargs):
     '''Plots the note sequence for visualisation.
 
     Parameters
@@ -436,8 +573,12 @@ def plot_notes(notes, ax=None, **kwargs):
         Tuple of note start times, note lengths, note values.
     ax : matplotlib.Axes, optional
         If provided, plot notes on custom axis. Default None.
+    octave : float, optional
+        How many octaves to shift the notes by, can be non-integer. Default 0.
+    thickness : float, optional
+        Thickness of note lines. Default 3.
     **kwargs : optional
-        Keyword arguments to pass to `plot`.
+        Keyword arguments to pass to `ax.fill`, (which draws the notes).
 
     Returns
     -------
@@ -449,23 +590,61 @@ def plot_notes(notes, ax=None, **kwargs):
     if not ax:
         fig, ax = plt.subplots()
         ax.set_xlabel('time')
-        ax.set_ylabel(r'$\log_2(f0)$')
+        ax.set_ylabel('MIDI note')
 
-    if 'c' not in kwargs and 'color' not in kwargs:
-        kwargs['color'] = 'red'
-
-    if 'lw' not in kwargs and 'linewidth' not in kwargs:
-        kwargs['linewidth'] = 2
-
-    xs, ys = [], []
+    h = thickness
     for ns, nl, nv in zip(*notes):
-        xs.extend([ns, ns+nl, ns+nl])
-        ys.extend([nv, nv, np.nan])
-
-    ax.plot(xs, ys, **kwargs)
+        freq = hz_to_midi(nv) + 12 * octave
+        lines = ax.fill([ns, ns+nl-0.02, ns+nl-0.02, ns], [freq-h, freq-h, freq+h, freq+h], **kwargs)
 
     return ax
 
+
+def midi_to_notes(fp, instrument=0, verbose=False):
+    '''Converts a MIDI file into a sequence of notes in the same format as the
+    output of `get_notes`. Useful for comparing the extracted melody with a
+    MIDI transcription.
+
+    Parameters
+    ----------
+    fp : string or file
+        File path or file handle to MIDI file
+    instrument : int, optional
+        Index of the instrument (track) to convert. Default 0.
+    verbose: bool
+        Print process of reading MIDI file. Default False.
+
+    Returns
+    -------
+    notes : tuple
+        Tuple of note start times, note lengths, note values.
+    '''
+
+    import pretty_midi as pm
+
+    if verbose:
+        print('\n- Loading {}'.format(fp))
+
+    mid = pm.PrettyMIDI(fp)
+    if verbose:
+        print('-- {} instruments, reading {}'.format(len(mid.instruments), instrument))
+    ins = mid.instruments[instrument]
+
+    ns = []
+    nl = []
+    nv = []
+
+    if verbose:
+        print('-- {} notes'.format(len(ins.notes)))
+
+    for n in ins.notes:
+        ns.append(n.start)
+        nl.append(n.end - n.start)
+        nv.append(midi_to_hz(n.pitch))
+        if verbose:
+            print('  ({:.2f}, {:.2f}, {:.2f})'.format(n.start, n.end-n.start, midi_to_hz(n.pitch)))
+
+    return ns, nl, nv
 
 
 def create_audio(notes, end_time=None, save_path=None, sf=44100, octave=0, **kwargs):
